@@ -84,7 +84,7 @@ mese_sim.save(save_db=True, save_config=True)
 print(f"Simulation complete!")
 print(f"Database contains {len(db.t1)} T1 values")
 print(f"Database contains {len(db.t2)} T2 values")
-print(fSignal tensor shape: {mese_sim.data.signal_mag.shape}")
+print(f"Signal tensor shape: {mese_sim.data.signal_mag.shape}")
 ```
 
 ## Understanding the Simulation Output
