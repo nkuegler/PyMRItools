@@ -249,6 +249,7 @@ class RF(Event):
         return types.SimpleNamespace(
             use=self.pulse_type, dead_time=self.t_dead_time_s, delay=self.t_delay_s,
             freq_offset=self.freq_offset_hz, phase_offset=self.phase_offset_rad,
+            freq_ppm=0.0, phase_ppm=0.0, center=self.t_mid,
             ringdown_time=self.t_ringdown_s, shape_dur=self.t_duration_s,
             signal=self.signal, t=self.t_array_s,
             type='rf'
@@ -861,7 +862,8 @@ class ADC(Event):
         return types.SimpleNamespace(
             dead_time=self.t_dead_time_s, delay=self.t_delay_s, dwell=self.t_dwell_s,
             freq_offset=self.freq_offset_hz, num_samples=self.num_samples,
-            phase_offset=self.phase_offset_rad, type='adc'
+            phase_offset=self.phase_offset_rad, type='adc', freq_ppm=0.0, phase_ppm=0.0,
+            phase_modulation=None, duration=self.t_duration_s
         )
 
     def plot(self):
