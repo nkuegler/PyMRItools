@@ -2,7 +2,7 @@
 name = "pymritools"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "nibabel>=5.3.2",
     "numpy>=2.3.4",
@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 
 [tool.uv.sources]
 twixtools = { git = "https://github.com/pehses/twixtools.git", rev = "master" }
-pypulseq = { git = "https://github.com/imr-framework/pypulseq.git", rev = "dev" }
+pypulseq = { git = "https://github.com/imr-framework/pypulseq.git", rev = "master" }
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
@@ -48,3 +48,4 @@ processing_unring = "pymritools.processing.unringing.gibbs_unr:main"
 processing_denoise_lcpca = "pymritools.processing.denoising.lcpca.denoise:main"
 seqprog_raw_data = "pymritools.seqprog.rawdata.rd_read:main"
 modeling_afi_b1 = "pymritools.modeling.b1_afi.modeling:main"
+pulseq_mese = "pymritools.seqprog.sequences.mese:main"
