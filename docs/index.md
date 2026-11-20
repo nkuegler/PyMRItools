@@ -1,231 +1,143 @@
-# PyMRITools - Python Tools for MRI
+# PyMRItools
 
-Welcome to the PyMRITools documentation. PyMRITools is a comprehensive Python toolbox for MRI sequence programming, reconstruction, simulation, processing, and analysis.
+PyMRItools is a Python toolbox for MRI sequence programming, raw data handling, reconstruction, simulation, processing and quantitative modeling.
+Most numerically heavy parts are written in [PyTorch](https://pytorch.org/) and can run on a GPU.
 
-## Overview
+The toolbox grew out of a research workflow for quantitative R2 / T2 mapping with multi-echo spin-echo (MESE) and
+multi-echo gradient and spin-echo (MEGESSE) sequences built with [Pulseq](https://pulseq.github.io/).
+The individual tools can be used on their own, but they are designed to work as one pipeline:
 
-PyMRITools provides state-of-the-art algorithms and utilities for:
+```text
+Sequence programming (seqprog) ── .seq, sampling_config.pkl, pulseq_config.json
+        │                    └─── kernels.pkl, te.json ──┐
+        ▼                                                ▼
+Scanner measurement                              EMC Bloch simulation (simulation.emc)
+        │                                                │
+        ▼                                                │
+Raw data sorting (seqprog.rawdata) ── k_space.pt         │
+        │                                                │
+        ▼                                                │
+Reconstruction (recon.loraks): AC-LORAKS / P-LORAKS      │
+        │                                                │
+        ▼                                                │
+Processing: denoising, unringing, coil compression       │
+        │                                                │ dictionary (DB .pkl)
+        ▼                                                ▼
+Modeling: dictionary matching (T2/R2, B1+), AFI B1+, mono-exponential fit
+```
 
-- **Simulation**: Bloch equation simulations using the EMC method
-- **Sequence Programming**: Event-based MRI pulse sequence design
-- **Reconstruction**: Advanced LORAKS (Low-Rank Modeling of Local k-Space Neighborhoods) reconstruction
-- **Processing**: Data preprocessing and post-processing including denoising and artifact correction
-- **Modeling**: Parameter estimation including B1+ mapping and dictionary fitting
+## Modules
 
-## Key Features
+| Module | Content | Documentation |
+|---|---|---|
+| `pymritools.seqprog` | Event / kernel based Pulseq sequence programming (MESE, MEGESSE), sampling patterns | [Sequence Programming](sequence_programming.md) |
+| `pymritools.seqprog.rawdata` | Sorting Siemens twix raw data of Pulseq or vendor sequences into k-space tensors | [Raw Data](raw_data.md) |
+| `pymritools.recon.loraks` | GPU implementation of AC-LORAKS and P-LORAKS for undersampled multi-channel, multi-echo data | [Reconstruction](recon.md) |
+| `pymritools.processing` | PCA denoising, noise bias correction, Gibbs unringing, coil compression, coil sensitivity estimates | [Processing](processing.md) |
+| `pymritools.simulation.emc` | Echo modulation curve (EMC) Bloch simulations of slice-selective MESE / MEGESSE sequences | [Simulation](simulation.md) |
+| `pymritools.modeling` | Dictionary matching (T2/R2, B1+), mono-exponential fitting, AFI B1+ mapping, ESPIRiT maps | [Modeling](modeling.md) |
+| `pymritools.config` | Configuration dataclasses (command line + JSON), the dictionary database `DB`, RF pulse objects | [Concepts](concepts.md) |
+| `pymritools.utils` | FFT helpers, data I/O (NIfTI, torch, numpy), indexing helpers, randomized SVDs, phantoms | [API Reference](api/utils.md) |
 
-!!! note "GPU Acceleration"
-    Most computationally intensive operations support GPU acceleration via PyTorch for significant performance improvements.
+## Quick start
 
-!!! tip "CLI & Python API"
-    All major tools provide both command-line interfaces and Python APIs for maximum flexibility in automated pipelines and interactive use.
+Install the package (see [Installation](installation.md) for details):
 
-## Quick Start
-
-### Installation
-
-```bash
-# Clone the repository
+```shell
 git clone https://github.com/schmidt-jo/PyMRItools.git
 cd PyMRItools
-
-# Using uv (recommended)
 uv sync
-
-# Or using conda
-mamba env create -f environment.yml
-mamba activate mri_tools_env
-pip install --no-deps -e .
 ```
 
-### Basic Usage
+Every tool reads its settings from command line arguments and/or a JSON configuration file.
+An output path (`-o`) is always required.
+Run any tool with `--help` to see all options:
 
-**Command Line:**
+```shell
+# AC-LORAKS reconstruction of a k-space tensor
+uv run recon_loraks -ik k_space.pt -ia affine.pt -o ./recon -p 5 -rank 150
 
-```bash
-# LORAKS reconstruction
-python -m pymritools.recon.loraks.recon -ik k_space.pt -p 5 -rank 180
+# PCA denoising of a multi-echo NIfTI image
+uv run processing_denoise_lcpca -i mese_echoes.nii.gz -o ./denoised
 
-# B1+ AFI mapping
-python -m pymritools.modeling.b1_afi.modeling -i afi.nii -fa 60 -n 5
-
-# LCPCA denoising
-python -m pymritools.processing.denoising.lcpca.denoise -i noisy.nii -p 0
+# B1+ map from a two-TR AFI acquisition
+uv run modeling_afi_b1 -i afi.nii.gz -o ./b1 -fa 60 -n 5
 ```
 
-**Python API:**
+The same functionality is available from Python, e.g.:
 
 ```python
-from pymritools.recon.loraks.loraks import Loraks, LoraksOptions
-from pymritools.modeling.b1_afi.modeling import Settings, processing
-from pymritools.processing.denoising.lcpca import denoise_lcpca
+import torch
+from pymritools.recon.loraks.loraks import Loraks
+from pymritools.recon.loraks.ac_loraks import AcLoraksOptions
 
-# LORAKS reconstruction
-options = LoraksOptions(loraks_neighborhood_size=5)
-loraks = Loraks.create(options)
-k_recon = loraks.reconstruct(k_space)
-
-# B1+ mapping
-settings = Settings(input_file="afi.nii", flip_angle=60.0, ratio_tr2_tr1=5)
-processing(settings)
-
-# LCPCA denoising
-denoised = denoise_lcpca(input_data=noisy_data, p=0, device='cuda')
+opts = AcLoraksOptions(loraks_neighborhood_size=5, max_num_iter=20)
+opts.rank.value = 150
+loraks = Loraks.create(opts)
+# k-space batches with dims [batch, channels * echoes, phase, read]
+k_recon = loraks.reconstruct(k_batched)
 ```
 
-## Module Overview
+See [Command Line Tools](cli.md) for a list of all entry points and the
+[MESE R2 mapping tutorial](tutorials/mese_r2_workflow.md) for a complete pipeline.
 
-### Simulation (`pymritools.simulation`)
+!!! warning "Research code"
+    PyMRItools is research software under active development.
+    Interfaces change, not every combination of options is tested, and some modules are experimental.
+    Known limitations are marked in the respective pages.
+    Please check results carefully and get in touch via
+    [GitHub issues](https://github.com/schmidt-jo/PyMRItools/issues) if something does not work.
 
-**EMC (echo modulation curve) simulation** using Bloch equations for accurate modeling of multi-echo MRI sequences:
+## References
 
-- Multi-parametric simulation (T₁, T₂, B₁⁺, B₀)
-- Slice profile modeling with isochromats
-- GPU acceleration for large parameter spaces
-- Database generation for dictionary matching
+Parts of the implemented code are based on the work of peers.
+If you use the respective tools, please consider citing their contributions:
 
-### Sequence Programming (`pymritools.seqprog`)
+- **EMC simulation and dictionary fitting:**
+  Ben-Eliezer N, Sodickson DK, Block KT.
+  Rapid and accurate T2 mapping from multi-spin-echo data using Bloch-simulation-based reconstruction.
+  *Magn Reson Med* 2015;73:809–817. [doi:10.1002/mrm.25156](https://doi.org/10.1002/mrm.25156)
+- **LORAKS:**
+  Haldar JP. Low-rank modeling of local k-space neighborhoods (LORAKS) for constrained MRI.
+  *IEEE Trans Med Imaging* 2014;33:668–681. [doi:10.1109/TMI.2013.2293974](https://doi.org/10.1109/TMI.2013.2293974)
+- **AC-LORAKS:**
+  Haldar JP. Autocalibrated LORAKS for fast constrained MRI reconstruction.
+  *Proc IEEE ISBI* 2015:910–913. [doi:10.1109/ISBI.2015.7164018](https://doi.org/10.1109/ISBI.2015.7164018)
+- **P-LORAKS:**
+  Haldar JP, Zhuo J. P-LORAKS: Low-rank modeling of local k-space neighborhoods with parallel imaging data.
+  *Magn Reson Med* 2016;75:1499–1514. [doi:10.1002/mrm.25717](https://doi.org/10.1002/mrm.25717)
+- **Joint multi-contrast LORAKS:**
+  Bilgic B, Kim TH, Liao C, et al. Improving parallel imaging by jointly reconstructing multi-contrast data.
+  *Magn Reson Med* 2018;80:619–632. [doi:10.1002/mrm.27076](https://doi.org/10.1002/mrm.27076)
+- **PCA denoising:**
+  Does MD, Olesen JL, Harkins KD, et al. Evaluation of principal component analysis image denoising on multi-exponential MRI relaxometry.
+  *Magn Reson Med* 2019;81:3503–3514. [doi:10.1002/mrm.27658](https://doi.org/10.1002/mrm.27658);
+  Veraart J, Fieremans E, Novikov DS. Diffusion MRI noise mapping using random matrix theory.
+  *Magn Reson Med* 2016;76:1582–1593. [doi:10.1002/mrm.26059](https://doi.org/10.1002/mrm.26059)
+- **Noise bias correction and noise estimation:**
+  Manjón JV, Coupé P, Buades A. MRI noise estimation and denoising using non-local PCA.
+  *Med Image Anal* 2015;22:35–47. [doi:10.1016/j.media.2015.01.004](https://doi.org/10.1016/j.media.2015.01.004);
+  St-Jean S, De Luca A, Tax CMW, Viergever MA, Leemans A. Automated characterization of noise distributions in diffusion MRI data.
+  *Med Image Anal* 2020;65:101758. [doi:10.1016/j.media.2020.101758](https://doi.org/10.1016/j.media.2020.101758)
+  ([autodmri](https://github.com/samuelstjean/autodmri))
+- **Gibbs unringing:**
+  Kellner E, Dhital B, Kiselev VG, Reisert M. Gibbs-ringing artifact removal based on local subvoxel-shifts.
+  *Magn Reson Med* 2016;76:1574–1581. [doi:10.1002/mrm.26054](https://doi.org/10.1002/mrm.26054)
+- **Coil compression:**
+  Huang F, Vijayakumar S, Li Y, Hertel S, Duensing GR. A software channel compression technique for faster reconstruction with many channels.
+  *Magn Reson Imaging* 2008;26:133–141. [doi:10.1016/j.mri.2007.04.010](https://doi.org/10.1016/j.mri.2007.04.010);
+  Zhang T, Pauly JM, Vasanawala SS, Lustig M. Coil compression for accelerated imaging with Cartesian sampling.
+  *Magn Reson Med* 2013;69:571–582. [doi:10.1002/mrm.24267](https://doi.org/10.1002/mrm.24267)
+- **ESPIRiT:**
+  Uecker M, Lai P, Murphy MJ, et al. ESPIRiT — an eigenvalue approach to autocalibrating parallel MRI: where SENSE meets GRAPPA.
+  *Magn Reson Med* 2014;71:990–1001. [doi:10.1002/mrm.24751](https://doi.org/10.1002/mrm.24751)
+- **AFI B1+ mapping:**
+  Yarnykh VL. Actual flip-angle imaging in the pulsed steady state: a method for rapid three-dimensional mapping of the transmitted radiofrequency field.
+  *Magn Reson Med* 2007;57:192–200. [doi:10.1002/mrm.21120](https://doi.org/10.1002/mrm.21120)
+- **Pulseq / PyPulseq:**
+  Layton KJ, Kroboth S, Jia F, et al. Pulseq: a rapid and hardware-independent pulse sequence prototyping framework.
+  *Magn Reson Med* 2017;77:1544–1552. [doi:10.1002/mrm.26235](https://doi.org/10.1002/mrm.26235);
+  Ravi KS, Geethanath S, Vaughan JT. PyPulseq: a Python package for MRI pulse sequence design.
+  *J Open Source Softw* 2019;4:1725. [doi:10.21105/joss.01725](https://doi.org/10.21105/joss.01725)
 
-**Event-based sequence programming** paradigm for flexible MRI pulse sequence design:
-
-- Atomic events: RF, GRAD, ADC, DELAY
-- Sequence kernels and composition
-- ISMRMRD integration for raw data handling
-- Support for MESE, MEGESSE sequences
-
-### Reconstruction (`pymritools.recon.loraks`)
-
-**LORAKS (Low-Rank Modeling of Local k-Space Neighborhoods)** - advanced reconstruction exploiting structured correlations:
-
-- **AC-LORAKS**: Fast reconstruction with auto-calibration regions
-- **P-LORAKS**: Penalized reconstruction for highly undersampled data
-- Multiple matrix operators (C and S matrices)
-- Flexible rank reduction strategies
-- GPU-accelerated optimization
-
-### Data Processing (`pymritools.processing`)
-
-Comprehensive data preprocessing and post-processing toolbox:
-
-- **Coil Compression**: PCA-based channel reduction
-- **Coil Sensitivity**: rSoS-based sensitivity map estimation
-- **LCPCA Denoising**: Local Clinical PCA with Marchenko-Pastur inequality
-- **Gibbs Unringing**: Ringing artifact removal using sub-voxel optimization
-
-### Modeling (`pymritools.modeling`)
-
-Parameter estimation and model fitting algorithms:
-
-- **B1+ AFI Mapping**: Actual Flip-angle Imaging
-- **Dictionary Fitting**: Grid search for T₁/T₂/B₁⁺ estimation
-- **Mono-exponential Fitting**: Decay model fitting
-- **ESPIRiT**: Eigenvalue-based coil sensitivity estimation
-
-## Mathematical Foundations
-
-### LORAKS Theory
-
-LORAKS exploits low-rank structure in local k-space neighborhoods:
-
-```
-C-Matrix: C[i,j] = k[i] * conj(k[j])
-S-Matrix: S P = C - P_mirrored
-
-Optimization: minimize ||M(k)||_* + λ * ||P⊙(k - k_sampled)||_2²
-```
-
-### Bloch Equations (EMC)
-
-EMC simulation solves the Bloch equations:
-
-```
-dMz/dt = (M0 - Mz)/T1
-dMxy/dt = -Mxy/T2 + γ * M × B(t)
-
-Matrix form: M(t + dt) = P(dt) × M(t)
-```
-
-### AFI B1+ Mapping
-
-The AFI method uses two acquisitions with different TR values:
-
-```
-r = S₁/S₂
-α = arccos((r·n - 1)/(n - r))
-B1⁺ = (α/α_set) × 100
-```
-
-## Tutorials
-
-- [Reconstruction Tutorial](tutorials/recon_tutorial.md) - LORAKS reconstruction with AC-LORAKS and P-LORAKS
-- [Modeling Tutorial](tutorials/modeling_tutorial.md) - B1+ mapping, dictionary fitting, and mono-exponential fitting
-- [Simulation Tutorial](tutorials/simulation_tutorial.md) - EMC simulation for database generation
-- [Complete Workflow Tutorial](tutorials/complete_workflow_tutorial.md) - End-to-end pipeline from raw data to final parameters
-
-## Common Patterns
-
-### Configuration Management
-
-All tools use a consistent configuration system:
-
-```python
-@dataclass
-class Settings(BaseClass):
-    config_file: str = ""          # JSON configuration file
-    out_path: str = ""             # Output directory
-    use_gpu: bool = True           # GPU acceleration
-    gpu_device: int = 0            # GPU device ID
-    visualize: bool = True         # Visualization toggle
-    debug: bool = False            # Debug mode
-    slurm: bool = False           # Slurm mode
-```
-
-### GPU Acceleration
-
-```python
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-settings.use_gpu = True
-```
-
-### Batch Processing
-
-```python
-settings.batch_size = 3000  # Process large datasets in batches
-settings.process_slice = False  # Process full volume or slice-by-slice
-```
-
-## Performance Considerations
-
-- **GPU vs CPU**: GPU acceleration provides 10-100x speedup for most operations
-- **Memory requirements**: LORAKS requires significant GPU memory for large k-space datasets
-- **Batch processing**: Use batched processing for large datasets to manage memory
-- **Algorithm selection**: Choose AC-LORAKS for speed, P-LORAKS for highly undersampled data
-
-## Citation
-
-If you use PyMRITools in your research, please cite the appropriate references:
-
-- EMC Simulation and Grid Search Fitting: [Ben-Eliezer et al. 2015](https://doi.org/10.1002/mrm.25156)
-- LORAKS Reconstruction: [Haldar et al. 2014](https://pubmed.ncbi.nlm.nih.gov/24595341/)
-- AC-LORAKS: [Tamir et al. 2017](https://ieeexplore.ieee.org/document/7164018/)
-- P-LORAKS: [Liang et al. 2014](https://pubmed.ncbi.nlm.nih.gov/25952136/)
-- LCPCA Denoising: [Does et al. 2019](https://doi.org/10.1002/mrm.27658)
-- ESPIRiT: [Uecker et al. 2014](https://doi.org/10.1002/mrm.25195)
-- Gibbs Unringing: [Kellner et al. 2016](https://doi.org/10.1002/mrm.26054)
-- B1+ AFI: [Yarnykh 2007](https://doi.org/10.1002/mrm.21194)
-
-## Getting Started
-
-- [Installation Guide](installation.md) - Detailed installation instructions
-- [Contributing](contribute/contributing.md) - How to contribute to PyMRITools
-- [Tutorials](#tutorials) - Module-specific tutorials
-- [API Reference](api.md) - Complete Python API reference
-
-## Reference Documentation
-
-- [Reconstruction](recon.md) - Complete LORAKS theory and algorithms
-- [Modeling](modeling.md) - All modeling approaches with mathematical foundations
-- [Processing](processing.md) - All processing algorithms with error analysis
-- [Simulation](simulation.md) - EMC simulation with Bloch equation details
-- [Sequence Programming](sequence_programming.md) - Event-based sequence building tutorial
-- [API Reference](api.md) - Complete class and method documentation
+The software itself can be cited via its Zenodo record: [doi:10.5281/zenodo.13992707](https://doi.org/10.5281/zenodo.13992707).

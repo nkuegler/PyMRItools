@@ -1,646 +1,192 @@
-# Data Processing and Analysis
+# Processing
 
-## Overview
+`pymritools.processing` contains image and k-space processing steps that are typically applied between
+reconstruction and modeling:
 
-PyMRITools provides comprehensive data processing tools for MRI data including coil compression, sensitivity estimation, denoising, and artifact correction.
+| Tool | Module | Command |
+|---|---|---|
+| [PCA denoising](#pca-denoising) | `processing.denoising.lcpca` | `processing_denoise_lcpca` |
+| [Noise bias correction](#noise-bias-correction) | `processing.denoising.lcpca` | part of the denoising command |
+| [Gibbs unringing](#gibbs-unringing) | `processing.unringing` | `processing_unring` |
+| [Coil compression](#coil-compression) | `processing.coil_compression` | Python only |
+| [Coil sensitivity estimates](#coil-sensitivity-estimates) | `processing.coil_sens.smap` | `python -m pymritools.processing.coil_sens.smap` |
 
-**Important Note:** This codebase includes LCPCA (Local Clinical PCA) but not MPPCA (Marchenko-Pastur PCA). The LCPCA implementation differs from standard MPPCA in patch size selection, structural adaptation, and noise handling methodology.
+## PCA denoising
 
-## Coil Compression
+The denoising follows the local PCA approach for multi-echo relaxometry data by Does et al. (2019):
+the redundancy of the echo dimension in small spatial neighborhoods is used to separate signal and noise
+components, and the number of signal components is chosen with the Marchenko–Pastur (MP) criterion of
+random matrix theory (Veraart et al. 2016).
 
-### Theoretical Background
+### Algorithm
 
-**Coil compression** reduces the number of receiver coils while preserving image quality using Principal Component Analysis (PCA) based on geometric coil sensitivity variations.
+For every slice and channel independently:
 
-#### Mathematical Principles
+1. For every in-plane voxel position, take a square patch of \(n\times n\) voxels with \(n = \lceil\sqrt{m}\rceil\),
+   where \(m\) is the number of echoes.
+   The patch forms a Casorati matrix \(\mathbf{X}\in\mathbb{C}^{n_v\times m}\) with \(n_v = n^2 \approx m\) voxels.
+2. Subtract the mean over the echo dimension and compute the SVD \(\mathbf{X} = \mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^H\)
+   with eigenvalues \(\lambda_i = \sigma_i^2/n_v\).
+3. Determine which components are noise.
+    With \(M = \min(m, n_v)\), a component \(p\) is classified as noise when
 
-**1. GCC (Geometric Coil Compression):**
-Based on Huang et al. (2008), coil sensitivities vary spatially but follow geometric patterns that can be captured by compression matrices.
+    \[
+    \frac{\lambda_{p+1} - \lambda_{M}}{4\sqrt{(M-p)/n_v}} < \frac{1}{M-p}\sum_{i>p} \lambda_i ,
+    \]
 
-**2. PCA-Based Compression:**
-```
-PCA on ACS data: C = U Σ Vᵀ
-Compress: k_compressed = U[:, :n_compressed]ᵀ · k_original
-```
+    i.e. when the spread of the remaining eigenvalues is compatible with the MP distribution of pure noise.
+    Alternatively, a fixed number of components `fixed_p` is kept.
 
-**3. Key Concepts:**
-- **ACS Region:** Fully-sampled central k-space used to compute compression
-- **Virtual Coils:** Computed from PCA along read direction for smooth transitions
-- **Slice-wise Processing:** Accounts for geometric variations across slices
+4. Reconstruct the patch from the kept components and add the mean back.
 
-### Python API Usage
+5. Patches overlap. Every voxel is the weighted average of all patch estimates containing it,
+   with weights \(\theta = 1/(1+p)\) that favour patches with fewer signal components (Manjón et al.).
 
-```python
-from pymritools.processing.coil_sens import compress_channels_2d
-import torch
+Real and complex input is supported.
 
-# Load or generate data
-k_space_data = torch.randn(256, 256, 32, 32, 5)  # [x, y, z, ch, t]
-sampling_mask = torch.ones(256, 256, 32, 32, 5, dtype=torch.bool)
+### Command line usage
 
-# Create undersampling pattern
-sampling_mask[:, 100:150, :, :, :] = False  # Undersampled region
-
-# Perform coil compression
-compressed_data = compress_channels_2d(
-    input_k_space=k_space_data,
-    sampling_pattern=sampling_mask,
-    num_compressed_channels=12,    # Target: 12 compressed channels
-    use_ac_data=True,              # Use ACS region for compression matrix
-    visualize=True,                # Show progress bar
-    device=torch.device('cuda:0')
-)
-
-print(f"Original: {k_space_data.shape} → Compressed: {compressed_data.shape}")
+```shell
+uv run processing_denoise_lcpca -i mese_echoes.nii.gz -o ./denoised
 ```
 
-### Key Functions
+| Option | Alias | Default | Description |
+|---|---|---|---|
+| `--in_path` | `-i` | example file | Input `.nii` or `.pt` file, `[x, y, z, (channel), echo]`. |
+| `--in_affine` | `-ia` | `""` | Affine `.pt` file (for `.pt` input). |
+| `--input_image_data` | `-iimg` | `True` | Set to `False` for k-space input; data is then transformed to image space along the first two dimensions. |
+| `--fixed_p` | `-p` | `0` | Number of components to keep; `0` determines them per patch with the MP criterion. |
+| `--noise_bias_correction` | `-nbc` | `False` | Apply the [noise bias correction](#noise-bias-correction) after denoising. |
+| `--noise_bias_mask` | `-nbm` | `""` | NIfTI mask of background (noise-only) voxels; estimated automatically if empty. |
+| `--normalize` | `-n` | `False` | Not used in the current implementation. |
+| `--file_prefix` | `-fp` | `d` | Not used in the current implementation. |
 
-```python
-def compress_channels_2d(
-    input_k_space: torch.tensor,
-    sampling_pattern: torch.tensor,
-    num_compressed_channels: int,
-    use_ac_data: bool = True,
-    visualize: bool = False,
-    device: torch.device = torch.get_default_device()
-) -> torch.tensor:
-    """
-    2D k-space channel compression using geometric coil compression.
-    
-    Parameters:
-        input_k_space: k-space data dims [x, y, z, ch, t]
-        sampling_pattern: Binary mask for sampled k-space points
-        num_compressed_channels: Target number of channels after compression
-        use_ac_data: Use only ACS region for compression matrix calculation
-        visualize: Enable progress bar
-        device: Computational device
-    
-    Returns:
-        Compressed k-space data with reduced channel dimension
-    """
-```
+Output files:
 
-### Compression Strategy
+| File | Content |
+|---|---|
+| `denoised_data.pt` | Denoised data (same dimensions as the input, singleton dimensions removed) |
+| `denoised_data.nii` | Denoised data; for multi-channel input combined by root-sum-of-squares |
+| `avg_p.nii` | Number of kept components, accumulated over all patches containing the voxel |
+| `denoised_data_nbc.pt` / `.nii`, `noise_mask.nii` | With `--noise_bias_correction` |
 
-**Channel Selection:**
-- Start with 32 channels → compress to 8-12 channels
-- Use PCA to find most significant coil patterns
-- Preserve 90-95% of information
-
-**Performance Impact:**
-- **Computation:** 2-4x faster for reconstruction
-- **Memory:** 2-4x reduced memory footprint
-- **Quality:** Minimal quality loss (< 2% SNR drop)
-
-## Coil Sensitivity Estimation
-
-### Theoretical Background
-
-**Coil sensitivity estimation** provides maps for parallel imaging reconstruction using a practical, low-pass filtering approach.
-
-#### Algorithm Steps
-
-1. **Convert to image space** (if needed)
-2. **Compute rSoS combined image** as reference
-3. **Divide individual coils** by reference
-4. **Apply low-pass filtering** in k-space
-5. **Compute coil correlation matrix**
-
-```python
-# Coil sensitivity estimation:
-s_i(x) = c_i(x) / (rSoS(x) + ε)
-where rSoS(x) = √(Σ_i |c_i(x)|²)
-```
-
-### Configuration
-
-```python
-from pymritools.config.processing.coil_sens import CoilSensConfig
-
-settings = CoilSensConfig(
-    input_data="multi_channel_data.nii.gz",    # Input file path
-    input_affine="",                          # Empty for NIfTI files
-    input_in_img_space=False,                 # Input is k-space
-    coil_dimension=3,                          # Channel is 4th dimension
-    smoothing_kernel=12,                      # Low-pass filter kernel size
-    out_path="./output",                      # Output directory
-    use_gpu=True,
-    gpu_device=0
-)
-```
-
-### Python API Usage
-
-```python
-from pymritools.config.processing.coil_sens import CoilSensConfig
-from pymritools.processing.coil_sens import smap
-
-# Configure settings
-settings = CoilSensConfig(
-    input_data="path/to/coil_data.nii.gz",
-    input_in_img_space=False,  # Input is k-space
-    coil_dimension=3,          # Channel is 4th dimension
-    smoothing_kernel=12,
-    out_path="./sensitivity_output/",
-    use_gpu=True,
-    gpu_device=0
-)
-
-# Run sensitivity map estimation
-smap(settings)
-```
-
-### CLI Usage
-
-```bash
-python -m pymritools.processing.coil_sens.smap \
-    -i input_data.nii.gz \
-    -o ./output/ \
-    -dim 3 \
-    -k 12
-
-# With GPU specification
-python smap.py -i data.nii.gz -o output/ -dim 3 -k 10 -gpu true -gpud 0
-```
-
-### Output Files
-
-**Main Output:**
-- `smap_*.nii.gz`: Coil sensitivity maps (one per coil)
-- `smap_combined.nii.gz`: rSoS combined reference
-- `covariance.json`: Coil correlation matrix
-- `covariance_plot.png`: Visualization of coil correlations
-
-## LCPCA Denoising
-
-### Theoretical Background
-
-**LCPCA (Local Clinical PCA)** implements advanced denoising using Marchenko-Pastur inequality and matrix completion theory.
-
-#### Mathematical Fundamentals
-
-**1. Patch Construction:**
-```
-Build patches: P[x,y,z, t × n] from spatial-time neighborhoods
-Patch shape: [cube_side_length, cube_side_length, cube_side_length, echoes]
-```
-
-**2. SVD Decomposition:**
-```
-P = U Σ Vᵀ
-PCA components: U[:, :p]}, singular values: Σ[:p, :p]
-```
-
-**3. Marchenko-Pastur Inequality:**
-```
-Optimal number of components p satisfies:
-(λ_{i} - λ_{m}) / (4√((m - i)/n_v)) < (1/(m - i)) * Σ_{j=i+1}^{m} λ_j
-```
-where λ are singular values in descending order.
-
-**4. Truncation and Aggregation:**
-```
-P_denoised = U[:, :p] Σ[:p, :p] V[:, :p]ᵀ
-Final: Weighted average of overlapping patches
-```
-
-#### Noise Bias Correction
-
-**Statistical Model:**
-```
-Corrected magnitude: √(max(|x|² - 2·n·σ², 0))
-where n = number of channels, σ = noise standard deviation
-```
-
-This correction assumes non-central chi distribution of magnitude data.
-
-### Configuration
-
-```python
-from pymritools.config.processing.lcpca import SettingsLCPCA
-
-settings = SettingsLCPCA(
-    in_path="noisy_multiecho.nii.gz",     # Input file
-    in_affine="",                         # Empty for NIfTI files  
-    file_prefix="d",                      # Output file prefix
-    normalize=False,                      # Normalize before PCA
-    input_image_data=True,                # Input is image space
-    noise_bias_correction=False,          # Enable NBC
-    fixed_p=0,                           # 0 = use MP inequality
-    noise_bias_mask="",                  # Pre-computed mask
-    out_path="./output"
-)
-```
-
-### Python API Usage
+### Python usage
 
 ```python
 import torch
 from pymritools.processing.denoising.lcpca import denoise_lcpca
 
-# Load noisy data
-imported_data = torch.load("noisy_multiecho.pt")
-
-# Scenario 1: Automatic component selection (MP inequality)
-denoised_data, access_mask, patch_counts = denoise_lcpca(
-    input_data=imported_data,
-    p=0,  # Use MP inequality for automatic selection
-    device=torch.device('cuda:0')
-)
-
-# Scenario 2: Fixed number of components
-denoised_data, access_mask, patch_counts = denoise_lcpca(
-    input_data=imported_data,
-    p=1,  # Keep first singular value
-    fixed_cube_side_length=5,             # Force 5×5×5 patches
-    device=torch.device('cuda:0')
-)
-
-# Scenario 3: With noise bias correction
-denoised_data_nbc = denoise_lcpca(
-    input_data=imported_data,
-    p=1,  # Keep first singular value
-    noise_bias_correction=True,
-    noise_bias_mask="",  # Auto-generate using autodmri
-    visualize=True
-)
+# data: [x, y, z, channel, echo] or [x, y, z, echo]
+denoised, weights, num_p = denoise_lcpca(input_data=data, p=0, device=torch.device("cuda"))
 ```
 
-### Core Functions
+`denoise_lcpca` (alias of `core_fn`) returns the denoised data, the accumulated patch weights and the accumulated number of kept components.
+Note that the Python default is `p=1` (keep one component); pass `p=0` for the MP criterion.
+
+## Noise bias correction
+
+Magnitude data has a positive noise floor (Rician or, for root-sum-of-squares combined multi-channel data,
+non-central χ distribution).
+The correction removes the first-order bias of the squared signal:
+
+\[
+S_\mathrm{corr} = \sqrt{\max\left(|S|^2 - 2N\sigma^2,\, 0\right)}
+\]
+
+with the noise level \(\sigma\) and the effective number of channels \(N\).
+Both are estimated from background voxels with the moment estimators of the non-central χ distribution
+(`pymritools.processing.denoising.stats.non_central_chi`).
+If no mask is given, background voxels are detected with [autodmri](https://github.com/samuelstjean/autodmri)
+(St-Jean et al. 2020) along all three axes and eroded.
 
 ```python
-def denoise_lcpca(
-    input_data: torch.Tensor,
-    p: int = 1,
-    fixed_cube_side_length: int = 1,
-    device: torch.device = torch.get_default_device(),
-    noise_bias_correction: bool = False,
-    noise_bias_mask: str = "",
-    visualize: bool = False
-) -> tuple:
-    """
-    LCPCA denoising implementation.
-    
-    Parameters:
-        input_data: 4D+ tensor [x, y, z, coils, additional_dims]
-        p: Number of singular values to keep (0 = automatic via MP inequality)
-        fixed_cube_side_length: Force specific patch size (1 = default)
-        device: Computation device
-        noise_bias_correction: Enable noise bias correction
-        noise_bias_mask: Path to noise mask ("" = auto-generate)
-        visualize: Show progress
-    
-    Returns:
-        (denoised_data, access_mask, patch_counts)
-    """
-```
-
-### Independent Noise Bias Correction
-
-```python
-from pymritools.modules import extract_noise_stats_from_mask, noise_bias_correction
-
-# Extract noise statistics
-sigma, n_channels = extract_noise_stats_from_mask(
-    input_data=noisy_data,
-    mask=noise_mask,
-    path_visuals="./noise_analysis/"
+from pymritools.processing.denoising.lcpca import (
+    extract_noise_mask, extract_noise_stats_from_mask, noise_bias_correction
 )
 
-# Apply noise bias correction
-corrected_data = noise_bias_correction(
-    denoised_data=denoised_data,
-    sigma=sigma,
-    num_channels=n_channels
-)
+mask = extract_noise_mask(input_data=data, erode_iter=2)
+sigma, n_channels = extract_noise_stats_from_mask(input_data=data, mask=mask)
+data_corrected = noise_bias_correction(denoised_data=denoised, sigma=sigma, num_channels=n_channels)
 ```
 
-### CLI Usage
+The correction assumes stationary noise, i.e. one \(\sigma\) for the whole volume.
 
-```python
-# Main denoising
-python -m pymritools.processing.denoising.lcpca.denoise \
-    -i noisy_data.nii.gz \
-    -o ./denoised_output/ \
-    -p 0 \
-    -nbc true
+## Gibbs unringing
 
-# With fixed threshold
-python denoise.py -i data.nii.gz -o output/ -p 2 -gpu true
+Removes Gibbs ringing with the local sub-voxel shift method of Kellner et al. (2016).
+For each image line, the image is shifted by sub-voxel amounts \(s/2M\) (\(s = -M,\dots,M-1\)).
+For every voxel the shift that minimises the total variation in a small neighborhood to the left or right
+(size \(k\)) is selected, and the result is interpolated back onto the original grid.
+For 2D images, the method is applied along x and y on images filtered with the weighting filters
+\(G_x = (1+\cos k_y)/(2+\cos k_x+\cos k_y)\) and \(G_y = (1+\cos k_x)/(2+\cos k_x+\cos k_y)\), and the two results are summed.
+The data is processed slice by slice (in-plane, first two dimensions).
 
-# Post-processing NBC only
-python denoise.py noise_bias_correct_util \
-    -i noisy_data.pt \
-    -in denoised_data.pt \
-    -ia affine.pt \
-    -o nbc_output/
+```shell
+uv run processing_unring -i mese_echoes.nii.gz -o ./unring -m 100 -k 3
 ```
 
-### Rank Selection
+| Option | Alias | Default | Description |
+|---|---|---|---|
+| `--input_file` | `-i` | `""` | Input NIfTI file, 2D to 4D (`x y (z) (t)`). |
+| `--num_shifts_per_voxel` | `-m` | `100` | Number of sub-voxel shifts \(M\). |
+| `--voxel_neighborhood_size` | `-k` | `3` | Neighborhood size \(k\) for the oscillation measure. |
 
-**Automatic (MP Inequality):**
-```python
-settings.fixed_p = 0  # Use Marchenko-Pastur inequality
-# Results in automatic rank selection per patch
-```
-
-**Fixed Rank:**
-```python
-settings.fixed_p = 1  # Keep first singular value only
-settings.fixed_p = 2  # Keep first 2 components
-# Provides more control but less adaptive
-```
-
-### Comparison: LCPCA vs MPPCA
-
-| Feature | LCPCA | MPPCA |
-|---------|-------|-------|
-| **Patch size** | Fixed size, configurable | Adaptive, based on local structure |
-| **Structure** | Uses local spatial-time neighborhoods | Uses adaptive neighborhoods |
-| **Noise handling** | Non-central chi bias correction | Central chi approximation |
-| **Implementation** | Available in PyMRITools | NOT available |
-
-## Gibbs Unringing
-
-### Theoretical Background
-
-**Gibbs unringing** removes Gibbs ringing artifacts based on Kellner et al. (2015, MRM) using sub-voxel optimization.
-
-#### Algorithm Principles
-
-**1. Weighting Filters:**
-```
-G_x = (1 + cos(k_y)) / (2 + cos(k_x) + cos(k_y))
-G_y = (1 + cos(k_x)) / (2 + cos(k_x) + cos(k_y))
-```
-
-**2. Shifted Image Generation:**
-For each voxel, generate M sub-voxel shifted images:
-```
-I_s(x) = Σ_k c_k * exp(2πi·k·(x + s/2M)) / N_k
-```
-
-**3. Optimal Shift Selection:**
-Find shifts that minimize oscillation measure within local neighborhoods:
-```
-O(x,s) = ||G_x ⊗ I_s||² + ||G_y ⊗ I_s||²
-s* = arg min O(x,s)
-```
-
-**4. Interpolation:**
-```
-Final image: Interpolate I_s* back to original grid
-```
-
-### Configuration
-
-```python
-from pymritools.config.processing.unringing import Settings
-
-settings = Settings(
-    input_file="gibbs_artifact.nii.gz",      # Input file
-    num_shifts_per_voxel=100,                # Number of shifts per voxel
-    voxel_neighborhood_size=3,               # Neighborhood size for optimization
-    out_path="./output"
-)
-```
-
-### Python API Usage
+The output is written as `ur_<input name>.nii` (magnitude).
 
 ```python
 import torch
 from pymritools.processing.unringing import gibbs_unring_nd
-from pymritools.utils import nifti_load
 
-# Load data (2D, 3D, or 4D)
-data, img = nifti_load("gibbs_artifact.nii.gz")
-image_tensor = torch.from_numpy(data)
-
-# Apply unringing
-unringed = gibbs_unring_nd(
-    image_data_nd=image_tensor,
-    m=150,      # Higher precision (more shifts)
-    k=3,        # 3-voxel neighborhood
-    visualize=True,
-    gpu=True,
-    gpu_device=0
-)
-
-# Save result
-from pymritools.utils import nifti_save
-nifti_save(
-    data=unringed.abs(),
-    img_aff=img.affine,
-    path_to_dir="./output",
-    file_name="unringed"
-)
+unringed = gibbs_unring_nd(image_data_nd=torch.from_numpy(data), m=100, k=3, gpu=True, visualize=False)
 ```
 
-### Core Functions
+!!! warning "Known limitation"
+    `gibbs_unring_nd` logs the device name with `torch.cuda.get_device_name()`, which fails without a CUDA device.
+
+## Coil compression
+
+`compress_channels_2d` reduces the number of receive channels with geometric-decomposition coil compression
+(GCC; Zhang et al. 2013, based on the SVD compression of Huang et al. 2008), for example to speed up the LORAKS reconstruction.
+
+- The read direction is detected from the sampling pattern (the fully sampled direction).
+- The data is transformed to image space along the read direction.
+- For every read position, compression matrices are computed by an SVD of the AC data (or all sampled data) over phase encodes and echoes,
+  and aligned along the read direction.
+- The compression is computed per slice, because the slices of 2D multi-slice data are already in image space.
 
 ```python
-def gibbs_unring_nd(
-    image_data_nd: torch.Tensor,
-    m: int = 100,
-    k: int = 3,
-    visualize: bool = True,
-    gpu: bool = False,
-    gpu_device: int = 0
-) -> torch.Tensor:
-    """
-    Multidimensional Gibbs unringing (2D-4D).
-    
-    Parameters:
-        image_data_nd: Input image data (2-4 dimensions)
-        m: Number of shifted images per voxel (higher = more precise)
-        k: Neighborhood size for optimization
-        visualize: Enable progress bars
-        gpu: Enable GPU acceleration
-    
-    Returns:
-        Unringed image data
-    """
-```
+from pymritools.processing.coil_compression import compress_channels_2d
 
-### CLI Usage
-
-```bash
-# Basic usage
-python -m pymritools.processing.unringing.gibbs_unr \
-    -i gibbs_image.nii.gz \
-    -o ./unringed_output/ \
-    -m 100 \
-    -k 3
-
-# With GPU acceleration
-python gibbs_unr.py -i data.nii.gz -o output/ -m 150 -k 4 -gpu true
-
-# High precision mode
-python gibbs_unr.py -i image.nii.gz -o results/ -m 200 -k 5 -gpu true -gpud 1
-```
-
-### Quality Control
-
-**Effectiveness Assessment:**
-
-```python
-import matplotlib.pyplot as plt
-
-# Compare before and after
-fig, (ax1, ax2) = plt.subplots(1, 2)
-
-ax1.imshow(gibbs_image.squeeze().cpu().numpy(), cmap='gray')
-ax1.set_title('With Gibbs Ringing')
-ax1.axis('off')
-
-ax2.imshow(unringed.squeeze().cpu().numpy(), cmap='gray')
-ax2.set_title('After Unringing')
-ax2.axis('off')
-
-# Profile comparison to quantify removal
-center_profile_original = gibbs_image[..., 128, :].squeeze().cpu().numpy()
-center_profile_unringed = unringed[..., 128, :].squeeze().cpu().numpy()
-
-plt.figure()
-plt.plot(center_profile_original, label='Original')
-plt.plot(center_profile_unringed, label='Unringed')
-plt.legend()
-plt.xlabel('Pixel position')
-plt.ylabel('Signal intensity')
-plt.title('Profile comparison')
-```
-
-## Configuration System
-
-All processing modules inherit from `BaseClass`:
-
-```python
-@dataclass
-class BaseClass(Serializable):
-    config_file: str = ""          # JSON configuration file path
-    out_path: str = ""             # Output directory path
-    use_gpu: bool = True           # GPU/CPU selection
-    gpu_device: int = 0            # Specific GPU index
-    visualize: bool = True         # Visualization toggle
-    debug: bool = False            # Debug mode toggle
-    slurm: bool = False           # Slurm mode
-```
-
-### Common Configuration Pattern
-
-```python
-# Load from file
-settings = MyConfig.from_json("config.json")
-
-# Load from CLI
-settings = MyConfig.from_cli(args, parser)
-
-# Manual construction  
-settings = MyConfig(param1=value1, param2=value2)
-```
-
-## Mathematical Summary
-
-| Algorithm | Key Equation | Parameters | Output |
-|-----------|--------------|------------|--------|
-| Coil Compression | k_comp = U[:, :n]ᵀ · k_orig | num_channels, ACS region | Compressed k-space |
-| Coil Sensitivity | s_i = c_i / rSoS(x) | smoothing_kernel | Sensitivity maps |
-| LCPCA | P_denoised = U[:, :p] Σ[:p, :p] V[:, :p]ᵀ | patch_size, MP inequality | Denoised image |
-| Gibbs Unringing | min O(x,s) = ‖G_x ⊗ I_s‖² + ‖G_y ⊗ I_s‖² | m (shifts), k (neighborhood) | Unringed image |
-
-## Performance Considerations
-
-### Memory Requirements
-
-**LCPCA Memory:**
-```
-memory ≈ batch_size × patch_size³ × echo_count × data_type
-Example: 3000 × 5³ × 16 × 8 bytes ≈ 48 MB per batch
-```
-
-**Gibbs Unringing Memory:**
-```
-memory ≈ voxels × m (shifts) × data_type
-Example: 256³ × 150 × 8 bytes ≈ 2 GB
-```
-
-### GPU Acceleration
-
-**Recommended Settings:**
-```python
-# LCPCA: Good for batch processing
-settings.use_gpu = True
-settings.batch_size = 3000  # Balances memory/speed
-
-# Gibbs: High precision benefits from GPU
-unringed = gibbs_unring_nd(img_tensor, m=150, gpu=True)
-```
-
-### Processing Pipeline
-
-**Typical Order:**
-1. **Noise estimation** (background.mprage.nii → noise.mask)
-2. **LCPCA denoising** (noisy.mprage.nii → denoised.mprage.nii)
-3. **Noise bias correction** (denoised.mprage.nii → corrected.mprage.nii)
-4. **Gibbs unringing** (corrected.mprage.nii → final.mprage.nii)
-
-## Common Use Cases
-
-### Scenario 1: Standard Denoising Pipeline
-
-```python
-from pymritools.processing.denoising.lcpca import denoise_lcpca
-from pymritools.utils import nifti_load, nifti_save
-
-# Load data
-data, img = nifti_load("noisy_multiecho.nii.gz")
-
-# Denoise
-denoised, mask, counts = denoise_lcpca(
-    input_data=torch.from_numpy(data),
-    p=0,  # Automatic rank selection
-    noise_bias_correction=True,
-    visualize=True
-)
-
-# Save result
-nifti_save(denoised.cpu().numpy(), img.affine, "./output/", "denoised")
-```
-
-### Scenario 2: Gibbs Ringing Removal
-
-```python
-from pymritools.processing.unringing import gibbs_unring_nd
-
-# High-precision unringing
-unringed = gibbs_unring_nd(
-    image_data_nd=gibbs_tensor,
-    m=200,  # High precision
-    k=5,    # Larger neighborhood
-    gpu=True,
-    visualize=True
+# k_space: [x, y, z, channel, echo], sampling_mask: [x, y, echo]
+k_compressed = compress_channels_2d(
+    input_k_space=k_space, sampling_pattern=sampling_mask,
+    num_compressed_channels=16, use_ac_data=True
 )
 ```
 
-### Scenario 3: Complete Processing Pipeline
+If the requested number of channels is larger than the number of available AC lines, it is reduced accordingly.
 
-```python
-# Step 1: Denoising
-denoised = denoise_lcpca(noisy_data, p=0, noise_bias_correction=True)
+## Coil sensitivity estimates
 
-# Step 2: Unringing  
-final = gibbs_unring_nd(denoised, m=150, k=3)
+`pymritools.processing.coil_sens.smap` computes a very approximate coil sensitivity estimate:
+every channel image is divided by the root-sum-of-squares combination, averaged over echoes, and low-pass filtered
+by keeping only a central `smoothing_kernel × smoothing_kernel` k-space region.
+It also writes the correlation matrix of the channel sensitivities (`smap_cov.json`, `smap_cov_plot.html`)
+and the maps as `smap.nii`.
 
-# Step 3: Analysis
-snr_improvement = calculate_snr(noisy_data, final) / calculate_snr(noisy_data, denoised)
-print(f"LCPCA SNR improvement: {snr_improvement:.2f}x")
+```shell
+python -m pymritools.processing.coil_sens.smap -i channel_images.pt -ia affine.pt -o ./smap -dim 3 -k 10
 ```
 
-## See Also
+| Option | Alias | Default | Description |
+|---|---|---|---|
+| `--input_data` | `-i` | `""` | `.pt` or `.nii` input with at least 4 dimensions. |
+| `--input_affine` | `-ia` | `""` | Affine `.pt` file (required for `.pt` input). |
+| `--input_in_img_space` | `-ii` | `True` | Set to `False` for k-space input. |
+| `--coil_dimension` | `-dim` | `3` | Channel dimension (0-based). |
+| `--smoothing_kernel` | `-k` | `10` | Size of the central k-space region kept for smoothing. |
 
-- [API Reference](api.md#processing) - Complete class and method documentation
-- [Configuration System](../contribute/writing_code.md#configuration) - How to use BaseClass configuration
-- [GPU Acceleration](#performance-optimization) - Performance considerations
-- [Noise Estimation](#noise-bias-correction) - Autodmri integration
-- [Reconstruction](recon.md) - Downstream reconstruction applications
+!!! warning "Known limitation"
+    For NIfTI input, the return values of `nifti_load` are unpacked in the wrong order in `smap()`; use `.pt` input.
+
+For proper sensitivity maps, use [ESPIRiT](modeling.md#espirit-sensitivity-maps).
